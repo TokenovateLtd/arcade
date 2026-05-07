@@ -17,6 +17,14 @@ name: Build and Push to GHCR
 #   - workflow_dispatch: manual run; gated via `needs:` chain on local jobs that
 #     re-verify the head SHA passed GoFortress before publishing.
 # ------------------------------------------------------------------------------------
+# Multi-arch strategy
+# ------------------------------------------------------------------------------------
+# Each architecture is built on its native runner (`ubuntu-24.04` for amd64,
+# `ubuntu-24.04-arm` for arm64) — no QEMU emulation. Each matrix job pushes a
+# single-arch image to GHCR by digest only (no tag). The merge-manifest job then
+# composes those digests into a single multi-arch manifest list under the existing
+# tag scheme (`<sha>` and `latest` / `<git-tag>`).
+# ------------------------------------------------------------------------------------
 
 on:
   workflow_run:
@@ -30,6 +38,10 @@ on:
   workflow_dispatch:
 
 permissions: {}
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: bsv-blockchain/arcade
 
 jobs:
   # --------------------------------------------------------------------------------
@@ -85,15 +97,26 @@ jobs:
     outputs:
       deployment_tag: ${{ steps.deployment_tag.outputs.id }}
 
+  # --------------------------------------------------------------------------------
+  # Per-arch native build. Each matrix entry runs on a native runner of its target
+  # architecture, cross-compiles the Go binary into dist/linux-<arch>/arcade, then
+  # uses buildx to assemble a single-arch image from the thin runtime Dockerfile
+  # and pushes it to GHCR by digest only. PRs build for verification but don't push.
+  # --------------------------------------------------------------------------------
   build-and-push:
-    # Gate the publishing step on:
-    #   - get_tag (computes the image tag)
-    #   - gofortress-gate (ensures lint/security/tests passed upstream)
     needs: [get_tag, gofortress-gate]
-    runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     steps:
       # Step 1: checkout code. For workflow_run events, check out the exact SHA
       # that GoFortress validated, not whatever HEAD happens to be on main now.
@@ -102,31 +125,124 @@ jobs:
         with:
           ref: ${{ github.event.workflow_run.head_sha || github.sha }}
 
-      # Step 2: Set up QEMU for multi-architecture builds
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@ce360397dd3f832beb865e1373c09c0e9f86d70a # v4.0.0
+      # Step 2: install Go and warm the module / build cache for this runner.
+      - name: Set up Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version-file: go.mod
+          cache: true
 
-      # Step 3: Set up Docker Buildx
+      # Step 3: build the binary natively into the dist layout the Dockerfile
+      # expects. GOOS/GOARCH are explicit so the path matches even if a future
+      # runner image defaults differ.
+      - name: Build arcade binary
+        env:
+          CGO_ENABLED: '0'
+          GOOS: linux
+          GOARCH: ${{ matrix.arch }}
+        run: |
+          mkdir -p dist/linux-${{ matrix.arch }}
+          go build -trimpath -ldflags="-s -w" -o dist/linux-${{ matrix.arch }}/arcade ./cmd/arcade
+
+      # Step 4: Set up Docker Buildx (no QEMU needed — single-platform build on
+      # a native runner of that platform).
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
 
-      # Step 4: login to GCHR
+      # Step 5: login to GHCR (skipped on PRs since we don't push).
       - name: Log in to GitHub Container Registry
+        if: github.event_name != 'pull_request'
         uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
         with:
-          registry: ghcr.io
+          registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Step 5: Build and push the Docker image
-      # Publishing is allowed only for non-PR events; PRs build for verification.
-      - name: Build and push Docker image
+      # Step 6a: PR build verifies the Dockerfile assembles for this arch but
+      # never pushes anywhere.
+      - name: Build image (PR verification, no push)
+        if: github.event_name == 'pull_request'
         uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
         with:
-          context: . # Build context (root directory, adjust if Dockerfile is elsewhere)
-          file: ./Dockerfile # Path to Dockerfile
-          platforms: linux/amd64 #, linux/arm64 Disable ARM for now
-          push: ${{ github.event_name != 'pull_request' }} # Only push on non-PR events
-          tags: |
-            ghcr.io/bsv-blockchain/arcade:${{ github.event.workflow_run.head_sha || github.sha }}
-            ghcr.io/bsv-blockchain/arcade:${{ needs.get_tag.outputs.deployment_tag }}
+          context: .
+          file: ./Dockerfile
+          platforms: linux/${{ matrix.arch }}
+          push: false
+
+      # Step 6b: non-PR build pushes by digest only (no tag). The merge-manifest
+      # job stitches per-arch digests into the final multi-arch tag.
+      - name: Build and push image by digest
+        if: github.event_name != 'pull_request'
+        id: build
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/${{ matrix.arch }}
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+
+      # Step 7: write the digest to a file named after itself so the merge job
+      # can reconstruct the per-arch image references.
+      - name: Export digest
+        if: github.event_name != 'pull_request'
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir -p "${RUNNER_TEMP}/digests"
+          touch "${RUNNER_TEMP}/digests/${DIGEST#sha256:}"
+
+      - name: Upload digest artifact
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: digests-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # --------------------------------------------------------------------------------
+  # Compose the per-arch digests into a single multi-arch manifest tagged
+  # :<sha> and :<deployment_tag>. Skipped on PRs (no digests produced).
+  # --------------------------------------------------------------------------------
+  merge-manifest:
+    needs: [build-and-push, get_tag]
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Download digest artifacts
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compose and push multi-arch manifest
+        working-directory: ${{ runner.temp }}/digests
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          SHA_TAG: ${{ github.event.workflow_run.head_sha || github.sha }}
+          DEPLOYMENT_TAG: ${{ needs.get_tag.outputs.deployment_tag }}
+        run: |
+          docker buildx imagetools create \
+            --tag "${IMAGE}:${SHA_TAG}" \
+            --tag "${IMAGE}:${DEPLOYMENT_TAG}" \
+            $(printf "${IMAGE}@sha256:%s " *)
+
+      - name: Inspect resulting manifest
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          SHA_TAG: ${{ github.event.workflow_run.head_sha || github.sha }}
+        run: docker buildx imagetools inspect "${IMAGE}:${SHA_TAG}"
