@@ -9,9 +9,12 @@ name: Build and Push to GHCR
 # successfully.
 #
 # Triggers:
-#   - workflow_run: fires after GoFortress completes. The `build-and-push` job only
-#     runs when GoFortress's conclusion is `success`. This applies to push-to-main,
-#     tag pushes (v*), and any other branch GoFortress runs on.
+#   - workflow_run: fires after GoFortress completes on `main` or a `v*` tag push.
+#     The gate job only proceeds when GoFortress's conclusion is `success` AND the
+#     upstream run was a `push` event (filtering out PR-triggered GoFortress runs,
+#     which are handled separately by the pull_request trigger below). For tag
+#     pushes, the image tag is taken from `workflow_run.head_branch` (e.g. v1.2.3)
+#     so the published image carries the release version, not just `latest`.
 #   - pull_request: kept so PRs still build the image (with `push: false`) for
 #     fast feedback. PR builds do NOT publish, so they don't need the gate.
 #   - workflow_dispatch: manual run; gated via `needs:` chain on local jobs that
@@ -32,6 +35,7 @@ on:
     types: [completed]
     branches:
       - main
+      - "v*" # Tag pushes appear here as head_branch (e.g. v1.2.3)
   pull_request:
     branches:
       - main
@@ -55,7 +59,8 @@ jobs:
     runs-on: ubuntu-latest
     if: >-
       github.event_name != 'workflow_run' ||
-      github.event.workflow_run.conclusion == 'success'
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push')
     steps:
       - name: Confirm upstream gates
         run: |
@@ -84,10 +89,12 @@ jobs:
         run: |
           # When triggered via workflow_run, github.ref points at the default branch
           # of the *triggering* workflow's repo state, not the original push ref.
-          # Tag-based releases publishing through workflow_run are out of scope here;
-          # GoFortress's own release job handles tag releases. For workflow_run we
-          # always tag the image as `latest` plus the commit SHA.
-          if [[ "$EVENT_NAME" == "push" && "$REF_TYPE" == "tag" ]]; then
+          # For workflow_run, derive the tag from the upstream run: tag pushes set
+          # workflow_run.head_branch to the tag name (e.g. v1.2.3); main pushes set
+          # it to `main`. Direct push/tag and dispatch events fall back to ref.
+          if [[ "$EVENT_NAME" == "workflow_run" && "$WR_EVENT" == "push" && "$WR_HEAD_BRANCH" =~ ^v[0-9] ]]; then
+            tag="$WR_HEAD_BRANCH"
+          elif [[ "$EVENT_NAME" == "push" && "$REF_TYPE" == "tag" ]]; then
             tag="$REF_NAME"
           else
             tag="latest"
