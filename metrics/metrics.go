@@ -267,15 +267,6 @@ var BumpBuilderShortCircuitTotal = promauto.NewCounter(prometheus.CounterOpts{
 	Help: "BLOCK_PROCESSED messages skipped because a compound BUMP already exists for the block.",
 })
 
-// BumpBuilderUntrackedTxidsTotal counts level-0 hashes pulled out of STUMPs
-// that the local TxTracker did not recognize. A non-zero rate is expected
-// (every block has subtree leaves that aren't watched by this arcade) but the
-// metric helps gauge how much UPDATE pressure the pre-filter step is saving.
-var BumpBuilderUntrackedTxidsTotal = promauto.NewCounter(prometheus.CounterOpts{
-	Name: "arcade_bump_builder_untracked_txids_total",
-	Help: "Level-0 STUMP hashes filtered out before SetMinedByTxIDs because the local TxTracker doesn't know them.",
-})
-
 // ---------------------------------------------------------------------------
 // watchdog (standalone service — block-processing recovery)
 // ---------------------------------------------------------------------------

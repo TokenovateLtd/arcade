@@ -43,12 +43,6 @@ type Builder struct {
 	publisher events.Publisher // nil-safe; broadcasts MINED status to SSE / webhooks
 	consumer  *kafka.ConsumerGroup
 	teranode  *teranode.Client
-	// txTracker is nil-safe: when unset, the post-build SetMined path runs with
-	// the unfiltered level-0 hash list (legacy behavior). When set, level-0
-	// hashes are pre-filtered to those the local tracker knows about, shrinking
-	// the SetMinedByTxIDs payload from O(all leaves in block) to O(tracked
-	// txids in block).
-	txTracker *store.TxTracker
 	// chainHeader, when non-nil, supplies the canonical merkle root for a
 	// block hash so the datahub-fetched response can be cross-checked at
 	// fetch time. Lets us reject a pruned/lying peer's response before
@@ -62,10 +56,7 @@ type Builder struct {
 // the builder reuses it (for DLQ routing) rather than creating a duplicate
 // connection. publisher fans MINED status updates out to subscribers.
 // teranodeClient supplies the live datahub URL list (static + p2p-discovered,
-// refreshed from the shared store) used for block fetches. txTracker, when
-// non-nil, gates the post-build SetMined call to txids the local tracker
-// knows about — a no-op for correctness (the SQL UPDATE filters by row
-// existence anyway) but a meaningful payload-size cut for large blocks.
+// refreshed from the shared store) used for block fetches.
 //
 // The block-processing watchdog lives in services/watchdog and runs as a
 // separate arcade service (mode=watchdog) — bump-builder is no longer
@@ -77,7 +68,6 @@ func New(
 	publisher events.Publisher,
 	st store.Store,
 	teranodeClient *teranode.Client,
-	txTracker *store.TxTracker,
 	chainHeader ChainHeaderReader,
 ) *Builder {
 	return &Builder{
@@ -87,7 +77,6 @@ func New(
 		producer:    producer,
 		publisher:   publisher,
 		teranode:    teranodeClient,
-		txTracker:   txTracker,
 		chainHeader: chainHeader,
 	}
 }
@@ -511,15 +500,15 @@ func (b *Builder) handleMessage(ctx context.Context, msg *kafka.Message) error {
 	// dedup path in BUMP-build rely on the height to anchor each MINED
 	// status to a specific block — a zero/missing height triggered F-029.
 	//
-	// BuildCompoundBUMP returns every level-0 hash in the compound (the
-	// caller's job is to filter). Pre-filter against TxTracker so the
-	// SetMinedByTxIDs UPDATE only carries txids the local store could
-	// possibly have. For mainnet blocks with thousands of leaves this
-	// drops payload size by ~99% even though the store-level WHERE clause
-	// would have filtered out the misses anyway.
-	tracked := b.filterTrackedTxids(txids)
-	if len(tracked) > 0 {
-		b.markMinedAndPublish(ctx, logger, blockHash, blockHeight, tracked)
+	// BuildCompoundBUMP returns every level-0 hash in the compound; hand the
+	// full list to SetMinedByTxIDs and let the store filter by row existence
+	// (its UPDATE … WHERE txid IN (…) RETURNING semantics guarantee unknown
+	// txids no-op and only actual transitions come back in `mined`). The
+	// previous in-memory pre-filter against TxTracker silently dropped txs
+	// submitted to api-server after bump-builder's per-pod tracker hydration
+	// in microservice mode.
+	if len(txids) > 0 {
+		b.markMinedAndPublish(ctx, logger, blockHash, blockHeight, txids)
 	}
 
 	// 7. Prune STUMPs
@@ -529,16 +518,12 @@ func (b *Builder) handleMessage(ctx context.Context, msg *kafka.Message) error {
 
 	logger.Info(
 		"BUMP built successfully",
-		zap.Int("tracked_txids", len(tracked)),
 		zap.Int("level0_count", len(txids)),
 		zap.Int("stumps_pruned", len(stumps)),
 	)
 	return nil
 }
 
-// filterTrackedTxids narrows a level-0 hash list to those the local
-// TxTracker knows about. If the builder was constructed without a tracker
-// (legacy wiring / tests), every txid is passed through unchanged.
 // tryShortCircuit attempts the BUMP-already-exists redelivery path. Returns
 // true when the short-circuit handled the message and the caller should
 // treat it as done. Returns false when no usable BUMP exists and the caller
@@ -573,15 +558,13 @@ func (b *Builder) tryShortCircuit(ctx context.Context, logger *zap.Logger, block
 		return false
 	}
 	metrics.BumpBuilderShortCircuitTotal.Inc()
-	tracked := b.filterTrackedTxids(txids)
 	logger.Info(
 		"BUMP already built — skipping datahub fetch on redelivery",
 		zap.Int("level0_count", len(txids)),
-		zap.Int("tracked_count", len(tracked)),
 		zap.Uint64("block_height", existingHeight),
 	)
-	if len(tracked) > 0 {
-		b.markMinedAndPublish(ctx, logger, blockHash, existingHeight, tracked)
+	if len(txids) > 0 {
+		b.markMinedAndPublish(ctx, logger, blockHash, existingHeight, txids)
 	}
 	// STUMP rows for this block should already have been pruned at the end
 	// of the original build; ensure stragglers are cleared in case a STUMP
@@ -590,17 +573,6 @@ func (b *Builder) tryShortCircuit(ctx context.Context, logger *zap.Logger, block
 		logger.Warn("failed to clean up STUMPs on short-circuit", zap.Error(delErr))
 	}
 	return true
-}
-
-func (b *Builder) filterTrackedTxids(txids []string) []string {
-	if b.txTracker == nil || len(txids) == 0 {
-		return txids
-	}
-	tracked, unknown := b.txTracker.FilterTrackedTxids(txids)
-	if unknown > 0 {
-		metrics.BumpBuilderUntrackedTxidsTotal.Add(float64(unknown))
-	}
-	return tracked
 }
 
 // levelZeroTxidsFromBUMP parses a stored compound BUMP and returns every

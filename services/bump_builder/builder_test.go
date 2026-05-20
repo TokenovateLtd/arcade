@@ -714,39 +714,6 @@ func TestBuilder_HandleMessage_BumpBuiltStoreError_StillSucceeds(t *testing.T) {
 	}
 }
 
-func TestBuilder_HandleMessage_HappyPath_WithTracker(t *testing.T) {
-	ms := newMockStore()
-	blockHash := testBlockHash
-	txidHex := testTxidHex
-
-	stumpData := makeMinimalSTUMP(txidHex)
-	ms.addStump(blockHash, 0, stumpData)
-
-	subtreeHash := mustHash(t, txidHex)
-	root := expectedCompoundRoot(t,
-		[]*models.Stump{{BlockHash: blockHash, SubtreeIndex: 0, StumpData: stumpData}},
-		[]chainhash.Hash{subtreeHash}, nil)
-	datahub := newDatahubServer(root, []chainhash.Hash{subtreeHash})
-	defer datahub.Close()
-
-	b := newTestBuilder(ms, datahub.URL)
-
-	err := b.handleMessage(context.Background(), makeBlockProcessedMsg(blockHash))
-	if err != nil {
-		t.Fatalf("expected no error, got: %v", err)
-	}
-
-	// Verify BUMP was stored and STUMPs pruned
-	ms.mu.Lock()
-	defer ms.mu.Unlock()
-	if _, ok := ms.bumps[blockHash]; !ok {
-		t.Error("expected BUMP to be stored")
-	}
-	if len(ms.deletedBlocks) != 1 {
-		t.Errorf("expected STUMPs to be pruned, got %d deletes", len(ms.deletedBlocks))
-	}
-}
-
 func TestBuilder_HandleMessage_EmptyBlockHash_ReturnsError(t *testing.T) {
 	ms := newMockStore()
 	datahub := newDatahubServer(zeroMerkleRoot(), nil)
@@ -887,6 +854,62 @@ func TestBuilder_E2E_InsertStump_GetStumps_BuildBUMP(t *testing.T) {
 	// Verify STUMPs were cleaned up
 	if len(ms.deletedBlocks) != 1 || ms.deletedBlocks[0] != blockHash {
 		t.Errorf("expected STUMPs for %s to be deleted, got: %v", blockHash, ms.deletedBlocks)
+	}
+}
+
+// TestBuilder_HandleMessage_PassesAllLevelZeroHashesToSetMined locks in the
+// post-fix contract: bump-builder hands every level-0 hash from the compound
+// BUMP to SetMinedByTxIDs and lets the store filter by row existence.
+//
+// Prior behavior pre-filtered against an in-memory TxTracker before calling
+// the store. In microservice deployments the bump-builder pod's tracker is
+// hydrated once at boot and never refreshed, so any tx submitted after that
+// (to a separate api-server pod) was silently dropped from MINED fan-out —
+// even when its row existed in postgres at SEEN_* and its leaf was in the
+// stored compound BUMP. The fix removes the pre-filter; this test fails if
+// anyone reintroduces it.
+//
+// Uses a two-leaf STUMP so the level-0 list has more than one entry, and
+// asserts both leaf hex strings appear in the SetMinedByTxIDs call.
+func TestBuilder_HandleMessage_PassesAllLevelZeroHashesToSetMined(t *testing.T) {
+	ms := newMockStore()
+	blockHash := testBlockHash
+	txidHex := testTxidHex
+	siblingHex := "2222222222222222222222222222222222222222222222222222222222222222"
+
+	stumpData := makeTwoLeafSTUMP(txidHex, siblingHex)
+	ms.addStump(blockHash, 0, stumpData)
+
+	subtreeHashes := []chainhash.Hash{
+		subtreeRootFromTwoLeafSTUMP(t, txidHex, siblingHex),
+	}
+	root := expectedCompoundRoot(t,
+		[]*models.Stump{{BlockHash: blockHash, SubtreeIndex: 0, StumpData: stumpData}},
+		subtreeHashes, nil)
+	datahub := newDatahubServer(root, subtreeHashes)
+	defer datahub.Close()
+
+	b := newTestBuilder(ms, datahub.URL)
+
+	if err := b.handleMessage(context.Background(), makeBlockProcessedMsg(blockHash)); err != nil {
+		t.Fatalf("handleMessage: %v", err)
+	}
+
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
+
+	if len(ms.minedCalls) != 1 {
+		t.Fatalf("expected 1 SetMinedByTxIDs call, got %d", len(ms.minedCalls))
+	}
+	got := ms.minedCalls[0].txids
+	saw := make(map[string]bool, len(got))
+	for _, s := range got {
+		saw[s] = true
+	}
+	for _, want := range []string{txidHex, siblingHex} {
+		if !saw[want] {
+			t.Errorf("SetMinedByTxIDs missing leaf %q; got %v", want, got)
+		}
 	}
 }
 

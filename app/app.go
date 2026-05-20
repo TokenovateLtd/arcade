@@ -325,7 +325,7 @@ func BuildServices(d *Deps) []services.Service {
 		if d.Chaintracks != nil {
 			chainHeader = chaintracksHeaderReader{ct: d.Chaintracks}
 		}
-		svcs = append(svcs, bump_builder.New(cfg, d.Logger, d.Producer, d.Publisher, d.Store, d.TeranodeClient, d.TxTracker, chainHeader))
+		svcs = append(svcs, bump_builder.New(cfg, d.Logger, d.Producer, d.Publisher, d.Store, d.TeranodeClient, chainHeader))
 	}
 	if shouldRun("watchdog") && cfg.Watchdog.Enabled {
 		if wd := watchdog.NewService(cfg, d.Logger, d.Store, d.Leaser, d.MerkleClient); wd != nil {
